@@ -160,6 +160,12 @@ def cut_audio(audio_path, save_dir, length=60):
 
     return audio_list
 
+def safe_path(path):
+    """If filename starts with '-', prepend './' so ffmpeg doesn't treat it as an option."""
+    dirname, basename = os.path.split(path)
+    if basename.startswith("-"):
+        return os.path.join(dirname, f"./{basename}")
+    return path
 
 def inference_process(args: argparse.Namespace):
     """
@@ -175,19 +181,10 @@ def inference_process(args: argparse.Namespace):
     cli_args = filter_non_none(vars(args))
     config = OmegaConf.load(args.config)
     config = OmegaConf.merge(config, cli_args)
-    source_image_path = config.source_image
-    driving_audio_path = config.driving_audio
-
-    save_path = os.path.join(config.save_path, Path(source_image_path).stem)
-    save_seg_path = os.path.join(save_path, "seg_video")
-    print("save path: ", save_path)
-    
-    if not os.path.exists(save_path):
-        os.makedirs(save_path)
-    if not os.path.exists(save_seg_path):
-        os.makedirs(save_seg_path)
-
-    motion_scale = [config.pose_weight, config.face_weight, config.lip_weight]
+    # source_image_path = config.source_image_dir
+    # driving_audio_path = config.driving_audio_dir
+    source_image_paths = config.source_image_dir
+    driving_audio_paths = config.driving_audio_dir
 
     # 2. runtime variables
     device = torch.device(
@@ -201,70 +198,7 @@ def inference_process(args: argparse.Namespace):
     else:
         weight_dtype = torch.float32
 
-    # 3. prepare inference data
-    # 3.1 prepare source image, face mask, face embeddings
-    img_size = (config.data.source_image.width,
-                config.data.source_image.height)
-    clip_length = config.data.n_sample_frames
-    face_analysis_model_path = config.face_analysis.model_path
-    with ImageProcessor(img_size, face_analysis_model_path) as image_processor:
-        source_image_pixels, \
-        source_image_face_region, \
-        source_image_face_emb, \
-        source_image_full_mask, \
-        source_image_face_mask, \
-        source_image_lip_mask = image_processor.preprocess(
-            source_image_path, save_path, config.face_expand_ratio)
-
-    # 3.2 prepare audio embeddings
-    sample_rate = config.data.driving_audio.sample_rate
-    assert sample_rate == 16000, "audio sample rate must be 16000"
-    fps = config.data.export_video.fps
-    wav2vec_model_path = config.wav2vec.model_path
-    wav2vec_only_last_features = config.wav2vec.features == "last"
-    audio_separator_model_file = config.audio_separator.model_path
-
-    
-    if config.use_cut:
-        audio_list = cut_audio(driving_audio_path, os.path.join(
-            save_path, f"seg-long-{Path(driving_audio_path).stem}"))
-
-        audio_emb_list = []
-        l = 0
-
-        audio_processor = AudioProcessor(
-                sample_rate,
-                fps,
-                wav2vec_model_path,
-                wav2vec_only_last_features,
-                os.path.dirname(audio_separator_model_file),
-                os.path.basename(audio_separator_model_file),
-                os.path.join(save_path, "audio_preprocess")
-            )
-        
-        for idx, audio_path in enumerate(audio_list):
-            padding = (idx+1) == len(audio_list)
-            emb, length = audio_processor.preprocess(audio_path, clip_length, 
-                                                     padding=padding, processed_length=l)
-            audio_emb_list.append(emb)
-            l += length
-        
-        audio_emb = torch.cat(audio_emb_list)
-        audio_length = l
-    
-    else:
-        with AudioProcessor(
-                sample_rate,
-                fps,
-                wav2vec_model_path,
-                wav2vec_only_last_features,
-                os.path.dirname(audio_separator_model_file),
-                os.path.basename(audio_separator_model_file),
-                os.path.join(save_path, "audio_preprocess")
-            ) as audio_processor:
-                audio_emb, audio_length = audio_processor.preprocess(driving_audio_path, clip_length)
-
-    # 4. build modules
+    # 2. prev: 4. build modules
     sched_kwargs = OmegaConf.to_container(config.noise_scheduler_kwargs)
     if config.enable_zero_snr:
         sched_kwargs.update(
@@ -335,148 +269,238 @@ def inference_process(args: argparse.Namespace):
     assert len(m) == 0 and len(u) == 0, "Fail to load correct checkpoint."
     print("loaded weight from ", os.path.join(audio_ckpt_dir, "net.pth"))
 
-    # 5. inference
-    pipeline = FaceAnimatePipeline(
-        vae=vae,
-        reference_unet=net.reference_unet,
-        denoising_unet=net.denoising_unet,
-        face_locator=net.face_locator,
-        scheduler=val_noise_scheduler,
-        image_proj=net.imageproj,
-    )
-    pipeline.to(device=device, dtype=weight_dtype)
 
-    audio_emb = process_audio_emb(audio_emb)
+    import glob
+    wav_files = sorted(glob.glob(os.path.join(driving_audio_paths, "*.wav")))
+    ref_files = sorted(glob.glob(os.path.join(source_image_paths, "*.png")))
 
-    source_image_pixels = source_image_pixels.unsqueeze(0)
-    source_image_face_region = source_image_face_region.unsqueeze(0)
-    source_image_face_emb = source_image_face_emb.reshape(1, -1)
-    source_image_face_emb = torch.tensor(source_image_face_emb)
+    ref_dict = {os.path.splitext(os.path.basename(f))[0]: f for f in ref_files}
+    for driving_audio_path in wav_files:
+        base = os.path.splitext(os.path.basename(driving_audio_path))[0]   # filename without extension
+        if base in ref_dict:
+            source_image_path = ref_dict[base]
+            print("#" * 30)
+            print("#" * 30)
+            print(f"Processing {base}: {source_image_path} + {driving_audio_path}")
 
-    source_image_full_mask = [
-        (mask.repeat(clip_length, 1))
-        for mask in source_image_full_mask
-    ]
-    source_image_face_mask = [
-        (mask.repeat(clip_length, 1))
-        for mask in source_image_face_mask
-    ]
-    source_image_lip_mask = [
-        (mask.repeat(clip_length, 1))
-        for mask in source_image_lip_mask
-    ]
-
-
-    times = audio_emb.shape[0] // clip_length
-
-    tensor_result = []
-
-    generator = torch.manual_seed(42)
-
-    ic(audio_emb.shape)
-    ic(audio_length)    
-    batch_size = 60
-    start = 0
-
-    for t in range(times):
-        print(f"[{t+1}/{times}]")
-
-        if len(tensor_result) == 0:
-            # The first iteration
-            motion_zeros = source_image_pixels.repeat(
-                config.data.n_motion_frames, 1, 1, 1)
-            motion_zeros = motion_zeros.to(
-                dtype=source_image_pixels.dtype, device=source_image_pixels.device)
-            pixel_values_ref_img = torch.cat(
-                [source_image_pixels, motion_zeros], dim=0)  # concat the ref image and the first motion frames
-        else:
-            motion_frames = tensor_result[-1][0]
-            motion_frames = motion_frames.permute(1, 0, 2, 3)
-            motion_frames = motion_frames[0-config.data.n_motion_frames:]
-            motion_frames = motion_frames * 2.0 - 1.0
-            motion_frames = motion_frames.to(
-                dtype=source_image_pixels.dtype, device=source_image_pixels.device)
-            pixel_values_ref_img = torch.cat(
-                [source_image_pixels, motion_frames], dim=0)  # concat the ref image and the motion frames
-        
-        pixel_values_ref_img = pixel_values_ref_img.unsqueeze(0)
-
-        pixel_motion_values = pixel_values_ref_img[:, 1:]
-
-        if config.use_mask:
-            b, f, c, h, w = pixel_motion_values.shape
-            rand_mask = torch.rand(h, w)
-            mask = rand_mask > config.mask_rate
-            mask = mask.unsqueeze(0).unsqueeze(0).unsqueeze(0)  
-            mask = mask.expand(b, f, c, h, w)  
-
-            face_mask = source_image_face_region.repeat(f, 1, 1, 1).unsqueeze(0)
-            assert face_mask.shape == mask.shape
-            mask = mask | face_mask.bool()
-
-            pixel_motion_values = pixel_motion_values * mask
-            pixel_values_ref_img[:, 1:] = pixel_motion_values
-
-        
-        assert pixel_motion_values.shape[0] == 1
-
-        audio_tensor = audio_emb[
-            t * clip_length: min((t + 1) * clip_length, audio_emb.shape[0])
-        ]
-        audio_tensor = audio_tensor.unsqueeze(0)
-        audio_tensor = audio_tensor.to(
-            device=net.audioproj.device, dtype=net.audioproj.dtype)
-        audio_tensor = net.audioproj(audio_tensor)
-
-        pipeline_output = pipeline(
-            ref_image=pixel_values_ref_img,
-            audio_tensor=audio_tensor,
-            face_emb=source_image_face_emb,
-            face_mask=source_image_face_region,
-            pixel_values_full_mask=source_image_full_mask,
-            pixel_values_face_mask=source_image_face_mask,
-            pixel_values_lip_mask=source_image_lip_mask,
-            width=img_size[0],
-            height=img_size[1],
-            video_length=clip_length,
-            num_inference_steps=config.inference_steps,
-            guidance_scale=config.cfg_scale,
-            generator=generator,
-            motion_scale=motion_scale,
-        )
-
-        ic(pipeline_output.videos.shape)
-        tensor_result.append(pipeline_output.videos)
-
-        if (t+1) % batch_size == 0 or (t+1)==times:
-            last_motion_frame = [tensor_result[-1]]
-            ic(len(tensor_result))
-
-            if start!=0:
-                tensor_result = torch.cat(tensor_result[1:], dim=2)
-            else:
-                tensor_result = torch.cat(tensor_result, dim=2)
+            save_path = os.path.join(config.save_path, Path(source_image_path).stem)
+            save_seg_path = os.path.join(save_path, "seg_video")
+            print("save path: ", save_path)
             
-            tensor_result = tensor_result.squeeze(0)
-            f = tensor_result.shape[1]
-            length = min(f, audio_length)
-            tensor_result = tensor_result[:, :length]
+            if not os.path.exists(save_path):
+                os.makedirs(save_path)
+            if not os.path.exists(save_seg_path):
+                os.makedirs(save_seg_path)
 
-            ic(tensor_result.shape)
-            ic(start)
-            ic(audio_length)
+            motion_scale = [config.pose_weight, config.face_weight, config.lip_weight]
 
-            name = Path(save_path).name
-            output_file = os.path.join(save_seg_path, f"{name}-{t+1:06}.mp4")
+            # 3. prepare inference data
+            # 3.1 prepare source image, face mask, face embeddings
+            img_size = (config.data.source_image.width,
+                        config.data.source_image.height)
+            clip_length = config.data.n_sample_frames
+            face_analysis_model_path = config.face_analysis.model_path
+            with ImageProcessor(img_size, face_analysis_model_path) as image_processor:
+                source_image_pixels, \
+                source_image_face_region, \
+                source_image_face_emb, \
+                source_image_full_mask, \
+                source_image_face_mask, \
+                source_image_lip_mask = image_processor.preprocess(
+                    source_image_path, save_path, config.face_expand_ratio)
 
-            tensor_to_video_batch(tensor_result, output_file, start, driving_audio_path)
-            del tensor_result
+            # 3.2 prepare audio embeddings
+            sample_rate = config.data.driving_audio.sample_rate
+            assert sample_rate == 16000, "audio sample rate must be 16000"
+            fps = config.data.export_video.fps
+            wav2vec_model_path = config.wav2vec.model_path
+            wav2vec_only_last_features = config.wav2vec.features == "last"
+            audio_separator_model_file = config.audio_separator.model_path
 
-            tensor_result = last_motion_frame
-            audio_length -= length
-            start += length
-    
-    return save_seg_path
+            
+            if config.use_cut:
+                audio_list = cut_audio(driving_audio_path, os.path.join(
+                    save_path, f"seg-long-{Path(driving_audio_path).stem}"))
+
+                audio_emb_list = []
+                l = 0
+
+                audio_processor = AudioProcessor(
+                        sample_rate,
+                        fps,
+                        wav2vec_model_path,
+                        wav2vec_only_last_features,
+                        os.path.dirname(audio_separator_model_file),
+                        os.path.basename(audio_separator_model_file),
+                        os.path.join(save_path, "audio_preprocess")
+                    )
+                
+                for idx, audio_path in enumerate(audio_list):
+                    padding = (idx+1) == len(audio_list)
+                    emb, length = audio_processor.preprocess(audio_path, clip_length, 
+                                                            padding=padding, processed_length=l)
+                    audio_emb_list.append(emb)
+                    l += length
+                
+                audio_emb = torch.cat(audio_emb_list)
+                audio_length = l
+            
+            else:
+                with AudioProcessor(
+                        sample_rate,
+                        fps,
+                        wav2vec_model_path,
+                        wav2vec_only_last_features,
+                        os.path.dirname(audio_separator_model_file),
+                        os.path.basename(audio_separator_model_file),
+                        os.path.join(save_path, "audio_preprocess")
+                    ) as audio_processor:
+                        audio_emb, audio_length = audio_processor.preprocess(driving_audio_path, clip_length)
+
+            #?
+
+            # 5. inference
+            pipeline = FaceAnimatePipeline(
+                vae=vae,
+                reference_unet=net.reference_unet,
+                denoising_unet=net.denoising_unet,
+                face_locator=net.face_locator,
+                scheduler=val_noise_scheduler,
+                image_proj=net.imageproj,
+            )
+            pipeline.to(device=device, dtype=weight_dtype)
+
+            audio_emb = process_audio_emb(audio_emb)
+
+            source_image_pixels = source_image_pixels.unsqueeze(0)
+            source_image_face_region = source_image_face_region.unsqueeze(0)
+            source_image_face_emb = source_image_face_emb.reshape(1, -1)
+            source_image_face_emb = torch.tensor(source_image_face_emb)
+
+            source_image_full_mask = [
+                (mask.repeat(clip_length, 1))
+                for mask in source_image_full_mask
+            ]
+            source_image_face_mask = [
+                (mask.repeat(clip_length, 1))
+                for mask in source_image_face_mask
+            ]
+            source_image_lip_mask = [
+                (mask.repeat(clip_length, 1))
+                for mask in source_image_lip_mask
+            ]
+
+
+            times = audio_emb.shape[0] // clip_length
+
+            tensor_result = []
+
+            generator = torch.manual_seed(42)
+
+            ic(audio_emb.shape)
+            ic(audio_length)    
+            batch_size = 60
+            start = 0
+
+            for t in range(times):
+                print(f"[{t+1}/{times}]")
+
+                if len(tensor_result) == 0:
+                    # The first iteration
+                    motion_zeros = source_image_pixels.repeat(
+                        config.data.n_motion_frames, 1, 1, 1)
+                    motion_zeros = motion_zeros.to(
+                        dtype=source_image_pixels.dtype, device=source_image_pixels.device)
+                    pixel_values_ref_img = torch.cat(
+                        [source_image_pixels, motion_zeros], dim=0)  # concat the ref image and the first motion frames
+                else:
+                    motion_frames = tensor_result[-1][0]
+                    motion_frames = motion_frames.permute(1, 0, 2, 3)
+                    motion_frames = motion_frames[0-config.data.n_motion_frames:]
+                    motion_frames = motion_frames * 2.0 - 1.0
+                    motion_frames = motion_frames.to(
+                        dtype=source_image_pixels.dtype, device=source_image_pixels.device)
+                    pixel_values_ref_img = torch.cat(
+                        [source_image_pixels, motion_frames], dim=0)  # concat the ref image and the motion frames
+                
+                pixel_values_ref_img = pixel_values_ref_img.unsqueeze(0)
+
+                pixel_motion_values = pixel_values_ref_img[:, 1:]
+
+                if config.use_mask:
+                    b, f, c, h, w = pixel_motion_values.shape
+                    rand_mask = torch.rand(h, w)
+                    mask = rand_mask > config.mask_rate
+                    mask = mask.unsqueeze(0).unsqueeze(0).unsqueeze(0)  
+                    mask = mask.expand(b, f, c, h, w)  
+
+                    face_mask = source_image_face_region.repeat(f, 1, 1, 1).unsqueeze(0)
+                    assert face_mask.shape == mask.shape
+                    mask = mask | face_mask.bool()
+
+                    pixel_motion_values = pixel_motion_values * mask
+                    pixel_values_ref_img[:, 1:] = pixel_motion_values
+
+                
+                assert pixel_motion_values.shape[0] == 1
+
+                audio_tensor = audio_emb[
+                    t * clip_length: min((t + 1) * clip_length, audio_emb.shape[0])
+                ]
+                audio_tensor = audio_tensor.unsqueeze(0)
+                audio_tensor = audio_tensor.to(
+                    device=net.audioproj.device, dtype=net.audioproj.dtype)
+                audio_tensor = net.audioproj(audio_tensor)
+
+                pipeline_output = pipeline(
+                    ref_image=pixel_values_ref_img,
+                    audio_tensor=audio_tensor,
+                    face_emb=source_image_face_emb,
+                    face_mask=source_image_face_region,
+                    pixel_values_full_mask=source_image_full_mask,
+                    pixel_values_face_mask=source_image_face_mask,
+                    pixel_values_lip_mask=source_image_lip_mask,
+                    width=img_size[0],
+                    height=img_size[1],
+                    video_length=clip_length,
+                    num_inference_steps=config.inference_steps,
+                    guidance_scale=config.cfg_scale,
+                    generator=generator,
+                    motion_scale=motion_scale,
+                )
+
+                ic(pipeline_output.videos.shape)
+                tensor_result.append(pipeline_output.videos)
+
+                if (t+1) % batch_size == 0 or (t+1)==times:
+                    last_motion_frame = [tensor_result[-1]]
+                    ic(len(tensor_result))
+
+                    if start!=0:
+                        tensor_result = torch.cat(tensor_result[1:], dim=2)
+                    else:
+                        tensor_result = torch.cat(tensor_result, dim=2)
+                    
+                    tensor_result = tensor_result.squeeze(0)
+                    f = tensor_result.shape[1]
+                    length = min(f, audio_length)
+                    tensor_result = tensor_result[:, :length]
+
+                    ic(tensor_result.shape)
+                    ic(start)
+                    ic(audio_length)
+
+                    name = Path(save_path).name
+                    output_file = os.path.join(save_seg_path, f"{name}-{t+1:06}.mp4")
+
+                    tensor_to_video_batch(tensor_result, output_file, start, driving_audio_path)
+                    del tensor_result
+
+                    tensor_result = last_motion_frame
+                    audio_length -= length
+                    start += length
+            merge_videos(save_seg_path, os.path.join(Path(save_seg_path).parent, f"{base}.mp4"))
+            
     
 
 
@@ -505,5 +529,5 @@ if __name__ == "__main__":
 
     
 
-    save_path = inference_process(command_line_args)
-    merge_videos(save_path, os.path.join(Path(save_path).parent, "merge_video.mp4"))
+    inference_process(command_line_args)
+    
