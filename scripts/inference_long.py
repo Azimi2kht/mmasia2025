@@ -275,9 +275,12 @@ def inference_process(args: argparse.Namespace):
     ref_files = sorted(glob.glob(os.path.join(source_image_paths, "*.png")))
 
     ref_dict = {os.path.splitext(os.path.basename(f))[0]: f for f in ref_files}
-    for driving_audio_path in wav_files:
-        base = os.path.splitext(os.path.basename(driving_audio_path))[0]   # filename without extension
+    wav_dict = {os.path.splitext(os.path.basename(f))[0]: f for f in wav_files}
+    for base in range(1, 25 + 1):
+        # base = os.path.splitext(os.path.basename(driving_audio_path))[0]   # filename without extension
+        base = str(base)
         if base in ref_dict:
+            driving_audio_path = wav_dict[base]
             source_image_path = ref_dict[base]
             print("#" * 30)
             print("#" * 30)
